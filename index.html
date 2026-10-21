@@ -106,6 +106,12 @@ input:focus-visible,button:focus-visible,summary:focus-visible{outline:3px solid
 .stamp.on{border:3px solid var(--hanko);background:var(--hanko-soft);color:var(--hanko);transform:rotate(-12deg)}
 .stamp[disabled]{cursor:default;opacity:.6}
 .status{font-size:.82rem;color:var(--muted);margin-top:18px}
+[hidden]{display:none!important}
+#sync-panel{margin-bottom:14px}
+.sync-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:2px}
+.btn{font:inherit;font-weight:700;border:0;border-radius:6px;padding:9px 16px;background:var(--indigo);color:var(--surface);cursor:pointer}
+.btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--line)}
+#sync-mycode{font-family:ui-monospace,Menlo,monospace;font-size:14px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
@@ -127,6 +133,24 @@ input:focus-visible,button:focus-visible,summary:focus-visible{outline:3px solid
       <div class="fact"><small>Si siguen el plan, juntarán</small><b id="f-proj">—</b><small id="f-proj-n"></small></div>
     </div>
   </header>
+
+  <details class="plan" id="sync-panel">
+    <summary><span>Sincronizar con tu pareja</span><span class="verdict" id="sync-verdict"></span></summary>
+    <div class="plan-body">
+      <div id="sync-off" class="plan-body" style="padding:0">
+        <p class="hint">Para que los dos vean los mismos sellos en sus teléfonos, uno crea el plan compartido y le manda el enlace o el código al otro.</p>
+        <div class="sync-row"><button class="btn" id="sync-create" type="button">Crear plan compartido</button></div>
+        <label>…o pega el enlace o código que te mandó tu pareja<input id="sync-code" type="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></label>
+        <div class="sync-row"><button class="btn" id="sync-join" type="button">Unirme</button></div>
+      </div>
+      <div id="sync-on" class="plan-body" style="padding:0" hidden>
+        <p class="hint">Sincronizando: cada sello o cambio al plan aparece en el otro teléfono en unos segundos. Sin internet, todo se guarda aquí y se envía al reconectar.</p>
+        <label>Código del plan<input id="sync-mycode" type="text" readonly></label>
+        <div class="sync-row"><button class="btn" id="sync-share" type="button">Compartir enlace</button><button class="btn ghost" id="sync-leave" type="button">Dejar de sincronizar</button></div>
+      </div>
+      <p class="hint" id="sync-msg"></p>
+    </div>
+  </details>
 
   <details class="plan" id="plan">
     <summary><span>Ajustar el plan</span><span class="verdict" id="verdict"></span></summary>
@@ -158,7 +182,7 @@ input:focus-visible,button:focus-visible,summary:focus-visible{outline:3px solid
 <script>
 (function(){
   const DEF = {meta:100000, semanas:78, inicio:"2026-10-19", base:20, aumento:20, tope:1000, nombres:["Persona 1","Persona 2"]};
-  let state = {cfg:{...DEF, nombres:[...DEF.nombres]}, stamps:{}};
+  let state = {cfg:{...DEF, nombres:[...DEF.nombres]}, stamps:{}, stampsT:{}, cfgT:0};
   let canWrite = true;
   const $ = id => document.getElementById(id);
   const fmt = n => "$" + Math.round(n).toLocaleString("es-MX");
@@ -247,6 +271,7 @@ input:focus-visible,button:focus-visible,summary:focus-visible{outline:3px solid
         b.disabled = !canWrite;
         b.addEventListener("click", () => {
           if (state.stamps[key]) delete state.stamps[key]; else state.stamps[key] = true;
+          state.stampsT[key] = Date.now(); markDirty(key);
           save(); render();
         });
         st.appendChild(b);
@@ -269,11 +294,11 @@ input:focus-visible,button:focus-visible,summary:focus-visible{outline:3px solid
         const v = e.target.value;
         if (k === "inicio"){ if (v) state.cfg.inicio = v; }
         else state.cfg[k] = Math.max(0, Number(v) || 0);
-        save(); render();
+        touchCfg(); save(); render();
       });
     });
     ["c-n0","c-n1"].forEach((id,i)=>$(id).addEventListener("change", e => {
-      state.cfg.nombres[i] = e.target.value.trim() || ("Persona " + (i+1)); save(); render();
+      state.cfg.nombres[i] = e.target.value.trim() || ("Persona " + (i+1)); touchCfg(); save(); render();
     }));
   }
 
@@ -282,15 +307,138 @@ input:focus-visible,button:focus-visible,summary:focus-visible{outline:3px solid
     try { const s = JSON.parse(localStorage.getItem("ahorro-japon") || "null"); if (s && s.cfg) return s; } catch(e){}
     return null;
   }
-  function save(){ saveLocal(); }
+  function save(){ saveLocal(); scheduleSync(); }
   function merge(d){
     if (!d || !d.cfg) return;
-    state = {cfg:{...DEF, ...d.cfg, nombres:(d.cfg.nombres || DEF.nombres).slice(0,2)}, stamps:{...(d.stamps||{})}};
+    state = {cfg:{...DEF, ...d.cfg, nombres:(d.cfg.nombres || DEF.nombres).slice(0,2)}, stamps:{...(d.stamps||{})}, stampsT:{...(d.stampsT||{})}, cfgT:Number(d.cfgT)||0};
+  }
+
+
+  // ───────── Sincronización entre teléfonos (Cloudflare Worker + D1) ─────────
+  const SYNC_URL = "https://rumbo-japon-sync.rumbo-sync-worker.workers.dev/sync/";
+  const ID_RE = /^[A-Za-z0-9_-]{20,64}$/;
+  let sy = loadSync(), syncTimer = null, syncing = false, again = false;
+
+  function loadSync(){
+    try {
+      const x = JSON.parse(localStorage.getItem("japon-sync") || "null");
+      if (x && ID_RE.test(x.plan)) return {plan:x.plan, since:Number(x.since)||0, dirty:x.dirty||{}, cfgDirty:!!x.cfgDirty};
+    } catch(e){}
+    return {plan:null, since:0, dirty:{}, cfgDirty:false};
+  }
+  function saveSync(){ try { localStorage.setItem("japon-sync", JSON.stringify(sy)); } catch(e){} }
+  function markDirty(key){ if (sy.plan){ sy.dirty[key] = 1; saveSync(); } }
+  function touchCfg(){ state.cfgT = Date.now(); if (sy.plan){ sy.cfgDirty = true; saveSync(); } }
+  function scheduleSync(delay){ if (!sy.plan) return; clearTimeout(syncTimer); syncTimer = setTimeout(doSync, delay == null ? 400 : delay); }
+  function setMsg(t){ $("status").textContent = t; $("sync-msg").textContent = t; }
+
+  async function doSync(){
+    if (!sy.plan) return;
+    if (syncing){ again = true; return; }
+    syncing = true;
+    const sent = {}, stamps = {};
+    for (const key of Object.keys(sy.dirty)){ const t = state.stampsT[key] || 0; sent[key] = t; stamps[key] = [state.stamps[key] ? 1 : 0, t]; }
+    const body = {since: sy.since, stamps};
+    const sentCfg = sy.cfgDirty ? state.cfgT : null;
+    if (sy.cfgDirty){ body.cfg = state.cfg; body.cfgT = state.cfgT; }
+    try {
+      const r = await fetch(SYNC_URL + sy.plan, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      if (!r.ok) throw new Error("http " + r.status);
+      const res = await r.json();
+      // Lo enviado ya está en el servidor, salvo que haya vuelto a cambiar mientras tanto.
+      for (const [key, t] of Object.entries(sent)) if ((state.stampsT[key] || 0) === t) delete sy.dirty[key];
+      if (sentCfg !== null && state.cfgT === sentCfg) sy.cfgDirty = false;
+      let changed = false, cfgChanged = false;
+      for (const [key, val] of Object.entries(res.stamps || {})){
+        const v = val[0], t = val[1];
+        if (t > (state.stampsT[key] || 0)){
+          if (v) state.stamps[key] = true; else delete state.stamps[key];
+          state.stampsT[key] = t; changed = true;
+        }
+      }
+      if (res.cfg && res.cfgT > state.cfgT){
+        state.cfg = {...DEF, ...res.cfg, nombres:(res.cfg.nombres || DEF.nombres).slice(0,2)};
+        state.cfgT = res.cfgT; changed = cfgChanged = true;
+      }
+      // Margen de 5 s: una escritura del otro teléfono pudo confirmarse después de que leímos.
+      sy.since = Math.max(0, (res.now || Date.now()) - 5000);
+      saveSync();
+      if (changed){
+        saveLocal();
+        const ae = document.activeElement;
+        if (cfgChanged && !(ae && ae.closest && ae.closest("#plan"))) fillForm();
+        render();
+      }
+      setMsg("Sincronizado a las " + new Date().toLocaleTimeString("es-MX", {hour:"2-digit", minute:"2-digit"}));
+    } catch(e){
+      setMsg("Sin conexión: se guardó aquí y se sincronizará al reconectar.");
+    } finally {
+      syncing = false;
+      if (again){ again = false; scheduleSync(); }
+    }
+  }
+
+  function renderSync(){
+    const on = !!sy.plan;
+    $("sync-off").hidden = on; $("sync-on").hidden = !on;
+    const v = $("sync-verdict"); v.className = "verdict " + (on ? "ok" : "short"); v.textContent = on ? "Activa" : "Sin sincronizar";
+    if (on) $("sync-mycode").value = sy.plan;
+  }
+  function newCode(){
+    const b = new Uint8Array(18); crypto.getRandomValues(b);
+    return btoa(String.fromCharCode(...b)).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+  }
+  function parseCode(t){
+    t = String(t || "").trim();
+    const m = t.match(/[#&?]c=([A-Za-z0-9_-]+)/), c = m ? m[1] : t;
+    return ID_RE.test(c) ? c : null;
+  }
+  function startPlan(code, creating){
+    sy = {plan:code, since:0, dirty:{}, cfgDirty:true};
+    const now = Date.now();
+    // Se sube lo que ya había en este teléfono (sellos y también los que se quitaron).
+    for (const key of Object.keys(state.stamps)){ if (creating && !state.stampsT[key]) state.stampsT[key] = now; sy.dirty[key] = 1; }
+    for (const key of Object.keys(state.stampsT)) sy.dirty[key] = 1;
+    if (creating && !state.cfgT) state.cfgT = now;
+    saveSync(); saveLocal(); renderSync(); scheduleSync(0);
+  }
+  const planLink = () => location.origin + location.pathname + "#c=" + sy.plan;
+
+  function bindSync(){
+    $("sync-create").addEventListener("click", () => { startPlan(newCode(), true); $("sync-panel").open = true; });
+    $("sync-join").addEventListener("click", () => {
+      const c = parseCode($("sync-code").value);
+      if (!c){ $("sync-msg").textContent = "Ese enlace o código no es válido."; return; }
+      $("sync-code").value = ""; startPlan(c, false);
+    });
+    $("sync-share").addEventListener("click", async () => {
+      const url = planLink();
+      if (navigator.share){ try { await navigator.share({title:"Rumbo a Japón", text:"Únete a nuestro plan de ahorro:", url}); return; } catch(e){ if (e && e.name === "AbortError") return; } }
+      try { await navigator.clipboard.writeText(url); $("sync-msg").textContent = "Enlace copiado. Mándaselo a tu pareja."; }
+      catch(e){ $("sync-msg").textContent = "Copia este enlace: " + url; }
+    });
+    $("sync-leave").addEventListener("click", () => {
+      if (!confirm("¿Dejar de sincronizar? Tus sellos se quedan en este teléfono, pero ya no se compartirán.")) return;
+      sy = {plan:null, since:0, dirty:{}, cfgDirty:false}; saveSync(); renderSync(); setMsg("Guardado en este dispositivo.");
+    });
+    setInterval(() => { if (sy.plan && !document.hidden) doSync(); }, 10000);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) scheduleSync(0); });
+    window.addEventListener("online", () => scheduleSync(0));
+  }
+  function joinFromHash(){
+    const m = location.hash.match(/[#&]c=([A-Za-z0-9_-]+)/);
+    if (!m) return;
+    history.replaceState(null, "", location.pathname + location.search);
+    const c = m[1];
+    if (!ID_RE.test(c) || sy.plan === c) return;
+    if (sy.plan && !confirm("Este teléfono ya sincroniza otro plan. ¿Cambiar al plan de este enlace?")) return;
+    startPlan(c, false);
   }
 
   const local = loadLocal(); if (local) merge(local);
   fillForm(); bindForm(); render();
   $("status").textContent = "Guardado en este dispositivo.";
+  bindSync(); renderSync(); joinFromHash(); if (sy.plan) scheduleSync(0);
 
   if ("serviceWorker" in navigator){ window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {})); }
 })();
